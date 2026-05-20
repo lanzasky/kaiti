@@ -1,72 +1,85 @@
 ---
 name: kaiti-skill
-description: Use when writing, rewriting, formatting, or preparing defense PPT blueprints for Chinese graduate proposal reports, especially food engineering/digital twin proposals requiring balanced literature review, academic DOCX formatting, and 16-slide oral defense planning.
+description: Use when the user needs a generic academic proposal engine driven by a Gemini Deep Research draft, a local references folder, and a school template; supports proposal synthesis, academic DOCX formatting with three-line tables, and 15-16 slide defense PPT blueprint generation.
 ---
 
 # Kaiti Skill
 
-This skill packages the proposal workflow developed for `预制菜热处理数字孪生开题报告`.
+This skill is a generic academic proposal assistant. It is not tied to any discipline, topic, model, equipment, or project name.
 
-## Core Workflow
+## When To Use
 
-Use `kaiti_workflow.py` when the user asks for any of:
+Use this skill when the user provides:
 
-1. Rewriting a proposal draft into a balanced, template-aligned Markdown report.
-2. Formatting a generated Word document against a Chinese academic template.
-3. Generating a 16-slide defense PPT blueprint with image placement and oral scripts.
+- `gemini_draft_file`: a Gemini Deep Research draft, outline, or initial proposal.
+- `references_dir`: a folder or file list containing local reference materials.
+- `template_file`: the target university or institute proposal template.
 
-## Python API
+## Core API
 
 ```python
 from kaiti_skill import (
-    rewrite_and_balance_proposal,
+    synthesize_and_rewrite_proposal,
     format_academic_docx,
-    generate_ppt_blueprint,
+    generate_generic_ppt_blueprint,
 )
 ```
 
-### Rewrite
+### 1. Proposal Synthesis
 
 ```python
-rewrite_and_balance_proposal(input_file, output_file)
+synthesize_and_rewrite_proposal(
+    gemini_draft_file,
+    references_dir,
+    template_file,
+    output_file,
+)
 ```
 
-Reads `.docx`, `.md`, or `.txt`; writes a Markdown proposal. If `OPENAI_API_KEY` is available, the function calls the OpenAI Responses API with the embedded V8-style rewrite prompt. Otherwise it writes a structured prompt package for Codex/human review.
+The function:
 
-### Format DOCX
+- reads the Gemini draft to infer the new topic, research object, objectives, and route;
+- extracts readable snippets from the local references folder;
+- extracts headings and hierarchy from the template;
+- calls an LLM when `OPENAI_API_KEY` is configured;
+- writes a Markdown proposal aligned to the template.
+
+If no API key is configured, it writes a complete prompt package to `output_file` so Codex can continue the generation transparently.
+
+### 2. Academic DOCX Formatting
 
 ```python
-format_academic_docx(input_docx, reference_template, output_docx)
+format_academic_docx(input_docx, template_file, output_docx)
 ```
 
-Applies academic formatting:
+The formatting engine applies cross-disciplinary Chinese academic formatting:
 
-- A4 page and template margins.
-- Songti Chinese, Times New Roman Latin/digits, small-four body size.
-- 1.5 line spacing and two-character first-line indent.
-- Black outside page border via WordprocessingML.
-- Three-line academic tables: top/bottom 1.5 pt, header line 0.75 pt, no vertical inner borders.
-- Hanging indent for references.
+- template page size and margins;
+- Songti Chinese body text, Times New Roman Latin/digits, small-four body size;
+- 1.5 line spacing and first-line indent;
+- black outside page border;
+- academic three-line tables: top/bottom 1.5 pt, header line 0.75 pt, no vertical borders, centered cell text;
+- centered figure/table captions and hanging reference indents.
 
-### PPT Blueprint
+### 3. Generic PPT Blueprint
 
 ```python
-generate_ppt_blueprint(input_docx, image_dir, output_blueprint)
+generate_generic_ppt_blueprint(input_docx, image_list, output_blueprint)
 ```
 
-Builds a strict 16-slide defense guide containing:
+The function reads the proposal text and creates a 15-16 page Word or Markdown defense guide with:
 
 - 【幻灯片标题】
 - 【指定插入图片】
 - 【PPT 核心文字】
 - 【汇报讲稿】
 
-If `output_blueprint` ends with `.docx`, the function creates a Word guide and embeds the assigned local images when available. Otherwise it writes Markdown.
+It assigns images by filename semantics. When no matching image is found, it leaves a red placeholder.
 
 ## CLI
 
 ```powershell
-python -m kaiti_skill.kaiti_workflow format input.docx template.docx output.docx
-python -m kaiti_skill.kaiti_workflow blueprint input.docx figures output.docx
-python -m kaiti_skill.kaiti_workflow rewrite input.docx output.md
+python -m kaiti_skill.kaiti_workflow synthesize draft.docx references template.docx proposal.md
+python -m kaiti_skill.kaiti_workflow format proposal.docx template.docx formatted.docx
+python -m kaiti_skill.kaiti_workflow blueprint proposal.docx figures blueprint.docx
 ```

@@ -1,14 +1,15 @@
 from __future__ import annotations
 
 import argparse
+import csv
 import json
 import os
 import re
-import textwrap
 import urllib.request
 from copy import deepcopy
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable
+from typing import Iterable, Sequence
 
 try:
     from docx import Document
@@ -16,68 +17,206 @@ try:
     from docx.enum.text import WD_ALIGN_PARAGRAPH
     from docx.oxml import OxmlElement
     from docx.oxml.ns import qn
-    from docx.shared import Cm, Pt
-except ImportError as exc:  # pragma: no cover - dependency message path
+    from docx.shared import Cm, Pt, RGBColor
+except ImportError as exc:  # pragma: no cover
     raise RuntimeError(
         "kaiti_skill requires python-docx. Install it with `python -m pip install python-docx`."
     ) from exc
 
 
-REWRITE_PROMPT = """\
-你是一位严谨的食品工程与自动化交叉学科博导，请将输入材料重写为正式开题报告 Markdown。
+DEFAULT_TEMPLATE_STRUCTURE = [
+    "第一部分 立论依据",
+    "1.1 研究背景与意义",
+    "1.2 国内外研究现状",
+    "1.3 文献评述与项目切入点",
+    "主要参考文献",
+    "第二部分 研究方案",
+    "2.1 研究目标",
+    "2.2 研究内容",
+    "2.3 研究技术路线",
+    "2.4 实验方案",
+    "2.5 可行性分析",
+    "2.6 预期研究进展",
+    "三、研究基础",
+    "四、经费预算",
+]
 
-必须执行以下规则：
-1. 第一部分立论依据约 9000-10000 字，不能把字数堆在单一小节，需均衡分配至 1.1、1.2.1、1.2.2、1.2.3、1.2.4 与 1.3。
-2. 1.1 采用“背景引入 -> 然而传统方法存在局限 -> 四个突出问题 -> 综上所述 -> 本研究意义”的模板逻辑。
-3. 1.2 国内外研究现状拆为四节：食品热加工 CFD 与多物理场、风味动力学与品质评价、多源感知与在线状态估计、ROM/ANODE 与 MPC。
-4. 每个 1.2 子节都要深入引用具体方法、设备、算法局限，并在末尾生成表头统一的总结表：研究对象 | 核心研究方法 | 观测指标 | 参考价值 | 局限性 | 参考文献。
-5. 文献引用必须按出场顺序连续编号，正文用上标方括号，主要参考文献放在 1.3 之后，条目之间空一行。
-6. 2.1 与 2.2 保持精炼概括；2.3 是技术路线主战场，必须采用流畅学术叙事，严禁“需求痛点：”“数学建模：”等机械小标题。
-7. 2.3 的四个细化部分均采用“问题引出 -> 工程实施 -> 公式 -> 参数解释 -> 对本课题意义”的夹叙夹议写法。
-8. 2.3 必须包含并解释 N-S 方程、Boussinesq 浮力项、Christiansen-Craig 非牛顿降黏、Darcy-Forchheimer 多孔阻力、Arrhenius 动力学、ANODE、MHE、Pareto-MPC。
-9. 2.4 实验方案与 2.3 明确分开，保留软硬件配置表、APBRS 泛化训练矩阵和对照组/实验组设计。
-10. 全文公式使用纯净 LaTeX：行内 $...$，独立公式 $$...$$，禁止使用 \\[ 或 \\]。
 
-请输出完整 Markdown，不要解释过程。
+SYNTHESIS_SYSTEM_PROMPT = """\
+你是一位严谨的通用学术开题报告写作助手。你将收到三类输入：
+1. Gemini Deep Research 生成的课题底稿；
+2. 本地参考文献库中提取的摘要、结论或正文片段；
+3. 目标学校或单位的开题报告模板章节结构。
+
+请严格执行：
+- 先识别新课题的研究对象、核心科学问题、研究目标、技术路线与验证方案。
+- 必须沿用模板中的章节标题和层级结构，不擅自改名、增删或重排核心章节。
+- “国内外研究现状”必须采用夹叙夹议的学术批判性语调：先概括研究趋势，再结合文献指出方法、证据、局限和启示；禁止机械罗列“某某做了什么”。
+- 将本地文献内容无缝缝合到 Gemini 底稿逻辑中，正文引用按出场顺序连续编号，参考文献列表与正文编号一一对应。
+- 字数分配要均衡，背景、现状、评述、研究方案和实验验证都要有足够信息量。
+- 技术路线部分要采用“问题引出 -> 实施路径 -> 方法/模型 -> 参数或指标解释 -> 本课题意义”的连贯叙事。
+- 所有公式使用纯净 Markdown LaTeX：行内 $...$，独立公式 $$...$$。
+- 输出完整 Markdown 正文，不要解释生成过程。
 """
 
 
-PPT_IMAGE_MAP = {
-    4: "PPT_FigA_问题提出真实拼图.png",
-    6: "图1：预制菜热处理数字孪生技术路线图.png",
-    7: "PPT_FigB_朴素CFD仿真底座.png",
-    8: "PPT_FigC_朴素多源检测流程.png",
-    9: "PPT_FigD_极简ANODE数学框图.png",
-    10: "图3：数字孪生数学模型与控制闭环框架图.png",
-    11: "图2：桌面级多模态微型杀菌釜实验平台布局图.png",
-    13: "预制菜热处理数字孪生前期仿真与优化成果综合图.png",
-}
+PPT_BLUEPRINT_PROMPT = """\
+请基于开题报告正文生成 15-16 页学术答辩 PPT 制作与演讲蓝图。
+每页必须包含：
+【幻灯片标题】
+【指定插入图片】
+【PPT 核心文字】
+【汇报讲稿】
+
+通用结构：
+1. 封面：自动提取题目、汇报人、单位或导师信息；
+2. 目录大纲；
+3. 研究背景；
+4. 核心痛点或科学问题；
+5. 国内外现状与局限；
+6. 研究目标与技术路线；
+7-10. 研究内容模块，按正文自动拆分为 3-4 页；
+11. 实验方案或验证机制；
+12. 创新点；
+13. 研究基础；
+14. 预期成果；
+15. 进度安排；
+16. 结尾页。
+
+图片分配规则：
+- 根据图片文件名语义自动分配至最匹配页面；
+- 若未找到合适图片，保留红色占位符；
+- 每页讲稿约 100 字，口语化、自信、逻辑自然。
+"""
+
+
+SUPPORTED_TEXT_SUFFIXES = {".txt", ".md", ".markdown", ".csv", ".docx", ".doc", ".pdf"}
+IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tif", ".tiff"}
+
+
+@dataclass
+class SourceBundle:
+    draft_text: str
+    template_structure: list[str]
+    references_pack: str
 
 
 def _path(value: str | os.PathLike) -> Path:
     return Path(value).expanduser().resolve()
 
 
-def _read_docx_text(path: Path) -> str:
+def _safe_read_text(path: Path, limit: int | None = None) -> str:
+    data = path.read_text(encoding="utf-8", errors="ignore")
+    return data[:limit] if limit else data
+
+
+def _read_docx_text(path: Path, limit: int | None = None) -> str:
     doc = Document(str(path))
-    paragraphs = [p.text.strip() for p in doc.paragraphs if p.text.strip()]
-    cells: list[str] = []
+    chunks: list[str] = []
+    for para in doc.paragraphs:
+        text = para.text.strip()
+        if text:
+            chunks.append(text)
     for table in doc.tables:
         for row in table.rows:
-            for cell in row.cells:
-                text = cell.text.strip()
-                if text:
-                    cells.append(text)
-    return "\n".join(paragraphs + cells)
+            cells = [cell.text.strip().replace("\n", " ") for cell in row.cells]
+            row_text = " | ".join(c for c in cells if c)
+            if row_text:
+                chunks.append(row_text)
+    text = "\n".join(chunks)
+    return text[:limit] if limit else text
 
 
-def _read_text_file(path: Path) -> str:
-    if path.suffix.lower() == ".docx":
-        return _read_docx_text(path)
-    return path.read_text(encoding="utf-8", errors="ignore")
+def _read_csv_text(path: Path, limit: int | None = None) -> str:
+    rows: list[str] = []
+    with path.open("r", encoding="utf-8-sig", errors="ignore", newline="") as f:
+        reader = csv.reader(f)
+        for idx, row in enumerate(reader):
+            if idx > 120:
+                break
+            clean = [cell.strip() for cell in row if cell.strip()]
+            if clean:
+                rows.append(" | ".join(clean))
+    text = "\n".join(rows)
+    return text[:limit] if limit else text
 
 
-def _openai_rewrite(prompt: str, model: str | None = None) -> str:
+def _read_pdf_text(path: Path, limit: int | None = None) -> str:
+    try:
+        import pypdf  # type: ignore
+    except Exception:
+        return f"[PDF 文献占位：{path.name}。当前环境未安装 pypdf，未提取正文。]"
+    chunks: list[str] = []
+    with path.open("rb") as f:
+        reader = pypdf.PdfReader(f)
+        for page in reader.pages[:8]:
+            text = page.extract_text() or ""
+            if text.strip():
+                chunks.append(text.strip())
+    text = "\n".join(chunks)
+    return text[:limit] if limit else text
+
+
+def _read_any_text(path: Path, limit: int | None = None) -> str:
+    suffix = path.suffix.lower()
+    if suffix == ".docx":
+        return _read_docx_text(path, limit)
+    if suffix == ".csv":
+        return _read_csv_text(path, limit)
+    if suffix == ".pdf":
+        return _read_pdf_text(path, limit)
+    return _safe_read_text(path, limit)
+
+
+def _iter_reference_paths(references_dir: str | os.PathLike) -> list[Path]:
+    root = _path(references_dir)
+    if root.is_file():
+        if root.suffix.lower() in SUPPORTED_TEXT_SUFFIXES:
+            return [root]
+        return []
+    if not root.exists():
+        raise FileNotFoundError(f"Reference path not found: {root}")
+    paths = [
+        p
+        for p in root.rglob("*")
+        if p.is_file() and not p.name.startswith("~$") and p.suffix.lower() in SUPPORTED_TEXT_SUFFIXES
+    ]
+    return sorted(paths, key=lambda p: p.name.lower())
+
+
+def _build_references_pack(references_dir: str | os.PathLike, max_files: int = 80, chars_per_file: int = 2200) -> str:
+    entries: list[str] = []
+    for idx, path in enumerate(_iter_reference_paths(references_dir)[:max_files], start=1):
+        text = _read_any_text(path, chars_per_file).strip()
+        if not text:
+            continue
+        entries.append(f"[R{idx}] 文件名：{path.name}\n{text}")
+    return "\n\n".join(entries) if entries else "未从 references_dir 中提取到可读文献内容。"
+
+
+def _extract_template_structure(template_file: str | os.PathLike) -> list[str]:
+    path = _path(template_file)
+    text = _read_any_text(path, 20000)
+    candidates: list[str] = []
+    heading_patterns = [
+        r"^第[一二三四五六七八九十]+[部分章节].{0,40}$",
+        r"^[一二三四五六七八九十]+、.{1,60}$",
+        r"^\d+(?:\.\d+){0,3}\s+.{1,80}$",
+        r"^主要参考文献$",
+        r"^参考文献$",
+        r"^经费预算$",
+        r"^研究基础$",
+    ]
+    for raw in text.splitlines():
+        line = re.sub(r"\s+", " ", raw.strip())
+        if not line or len(line) > 100:
+            continue
+        if any(re.match(pattern, line) for pattern in heading_patterns) and line not in candidates:
+            candidates.append(line)
+    return candidates or DEFAULT_TEMPLATE_STRUCTURE.copy()
+
+
+def _call_openai(prompt: str, model: str | None = None, timeout: int = 900) -> str:
     api_key = os.getenv("OPENAI_API_KEY")
     if not api_key:
         raise RuntimeError("OPENAI_API_KEY is not set.")
@@ -88,13 +227,10 @@ def _openai_rewrite(prompt: str, model: str | None = None) -> str:
     req = urllib.request.Request(
         "https://api.openai.com/v1/responses",
         data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
-        headers={
-            "Authorization": f"Bearer {api_key}",
-            "Content-Type": "application/json",
-        },
+        headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
         method="POST",
     )
-    with urllib.request.urlopen(req, timeout=600) as resp:
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
         data = json.loads(resp.read().decode("utf-8"))
     chunks: list[str] = []
     for item in data.get("output", []):
@@ -107,30 +243,50 @@ def _openai_rewrite(prompt: str, model: str | None = None) -> str:
     return result
 
 
-def rewrite_and_balance_proposal(input_file: str | os.PathLike, output_file: str | os.PathLike) -> Path:
-    """Rewrite a proposal draft into a balanced V8-style Markdown document.
+def _build_source_bundle(
+    gemini_draft_file: str | os.PathLike,
+    references_dir: str | os.PathLike,
+    template_file: str | os.PathLike,
+) -> SourceBundle:
+    draft = _read_any_text(_path(gemini_draft_file), 70000)
+    refs = _build_references_pack(references_dir)
+    structure = _extract_template_structure(template_file)
+    return SourceBundle(draft_text=draft, template_structure=structure, references_pack=refs)
 
-    If `OPENAI_API_KEY` is available, this function calls the OpenAI Responses API.
-    Without an API key it writes a reproducible prompt package to `output_file`, so
-    Codex can continue the rewrite with the same constraints.
+
+def synthesize_and_rewrite_proposal(
+    gemini_draft_file: str | os.PathLike,
+    references_dir: str | os.PathLike,
+    template_file: str | os.PathLike,
+    output_file: str | os.PathLike,
+) -> Path:
+    """Create a template-aligned proposal from a Gemini draft and local references.
+
+    The function attempts to call an LLM through the OpenAI Responses API. If no
+    API key is configured, it writes a complete, reusable prompt package to
+    `output_file` rather than silently inventing content.
     """
 
-    src = _path(input_file)
-    dst = _path(output_file)
-    source_text = _read_text_file(src)
-    prompt = f"{REWRITE_PROMPT}\n\n# 输入材料\n\n{source_text}"
+    bundle = _build_source_bundle(gemini_draft_file, references_dir, template_file)
+    prompt = (
+        f"{SYNTHESIS_SYSTEM_PROMPT}\n\n"
+        "# 模板章节结构\n"
+        + "\n".join(f"- {item}" for item in bundle.template_structure)
+        + "\n\n# Gemini Deep Research 底稿\n"
+        + bundle.draft_text
+        + "\n\n# 本地文献库提取内容\n"
+        + bundle.references_pack
+    )
     try:
-        output = _openai_rewrite(prompt)
+        output = _call_openai(prompt)
     except Exception as exc:
         output = (
-            "# 开题报告重写任务包\n\n"
-            "> 当前环境未完成在线 AI 重写，以下为可复现的 V8 风格重写 Prompt 与输入材料。\n\n"
-            f"> 触发原因：{exc}\n\n"
-            "## 重写 Prompt\n\n"
-            f"{REWRITE_PROMPT}\n\n"
-            "## 输入材料\n\n"
-            f"{source_text}\n"
+            "# 通用学术开题报告生成任务包\n\n"
+            f"> 当前未完成在线 LLM 生成：{exc}\n\n"
+            "## 可复用生成指令\n\n"
+            f"{prompt}\n"
         )
+    dst = _path(output_file)
     dst.parent.mkdir(parents=True, exist_ok=True)
     dst.write_text(output, encoding="utf-8")
     return dst
@@ -196,7 +352,7 @@ def _set_table_borders(table) -> None:
         elem = OxmlElement(f"w:{edge}")
         if edge in {"top", "bottom"}:
             elem.set(qn("w:val"), "single")
-            elem.set(qn("w:sz"), "12")  # 1.5 pt
+            elem.set(qn("w:sz"), "12")
             elem.set(qn("w:color"), "000000")
         else:
             elem.set(qn("w:val"), "nil")
@@ -218,7 +374,7 @@ def _set_cell_borders(cell, header_bottom: bool = False) -> None:
         elem = OxmlElement(f"w:{edge}")
         if edge == "bottom" and header_bottom:
             elem.set(qn("w:val"), "single")
-            elem.set(qn("w:sz"), "6")  # 0.75 pt
+            elem.set(qn("w:sz"), "6")
             elem.set(qn("w:color"), "000000")
         else:
             elem.set(qn("w:val"), "nil")
@@ -233,13 +389,13 @@ def _is_caption(text: str) -> bool:
 
 def format_academic_docx(
     input_docx: str | os.PathLike,
-    reference_template: str | os.PathLike,
+    template_file: str | os.PathLike,
     output_docx: str | os.PathLike,
 ) -> Path:
-    """Apply Chinese academic proposal formatting to a DOCX document."""
+    """Apply cross-disciplinary Chinese academic DOCX formatting."""
 
     src = _path(input_docx)
-    template_path = _path(reference_template)
+    template_path = _path(template_file)
     dst = _path(output_docx)
     doc = Document(str(src))
     template = Document(str(template_path))
@@ -259,12 +415,12 @@ def format_academic_docx(
     in_refs = False
     for para in doc.paragraphs:
         text = para.text.strip()
-        if text == "主要参考文献":
+        if text in {"主要参考文献", "参考文献"}:
             in_refs = True
-        elif text.startswith("第二部分"):
+        elif re.match(r"^(第二部分|二、|2\s+|2\.)", text):
             in_refs = False
 
-        if para.style.name.startswith("Heading 1") or text.startswith(("第一部分", "第二部分", "三、", "四、")):
+        if para.style.name.startswith("Heading 1") or re.match(r"^(第[一二三四五六七八九十]+[部分章节]|[一二三四五六七八九十]+、)", text):
             para.alignment = WD_ALIGN_PARAGRAPH.CENTER
             para.paragraph_format.first_line_indent = None
             para.paragraph_format.line_spacing = 1.5
@@ -322,69 +478,240 @@ def format_academic_docx(
     return dst
 
 
-def _make_slide_blueprint() -> list[dict]:
-    return [
-        {"no": 1, "title": "封面｜基于物理信息降阶模型与虚实同步校正的预制菜热加工数字孪生系统研究", "core": ["中国农业大学工学院", "硕士开题答辩", "汇报人：杨阳", "导师：张小栓 教授"], "script": "尊敬的各位评委老师，大家好。我是中国农业大学工学院的硕士生杨阳。今天我开题汇报的题目是《基于物理信息降阶模型与虚实同步校正的预制菜热加工数字孪生系统研究》。"},
-        {"no": 2, "title": "结构大纲｜Contents", "core": ["01 问题提出", "02 研究目标", "03 研究内容", "04 研究基础与预期进展"], "script": "本次汇报将严格按照问题提出、研究目标、研究内容以及研究基础与预期进展这四个部分展开。"},
-        {"no": 3, "title": "1.1 研究背景", "core": ["预制菜产业高速发展", "热处理是杀菌保藏、风味形成的核心工序", "经验式加工面临批次波动大、标准化程度低的挑战"], "script": "预制菜产业正在经历从经验加工向数字智造的转型。热处理决定产品保存、安全和风味，但目前主要依赖经验试错，缺乏对食品内部状态的透明化管控。"},
-        {"no": 4, "title": "1.2 核心痛点：“不可能三角”", "core": ["中心冷点杀菌安全", "表层组织过热劣变", "生产加工效率"], "script": "复合预制菜内部对流受限，形成安全、品质与效率的不可能三角。长时间杀菌能保护冷点安全，却会造成表层肉质变柴和风味流失；缩短时间又可能带来安全风险。"},
-        {"no": 5, "title": "1.3 现有研究现状与局限", "core": ["高保真 CFD 算得准但太慢", "单点温度监控无法反映全局品质", "缺乏多目标协同优化的动态控制系统"], "script": "现有高保真 CFD 准确但难以在线应用，单点温度传感又无法反映风味与质构破坏。因此需要一套看得透、算得快、能自动校正的数字孪生系统。"},
-        {"no": 6, "title": "2.1 研究目标与技术路线", "core": ["构建“感知-对齐-预测-决策-验证”一体化数字孪生平台", "实现安全、品质与效率的闭环优化"], "script": "本课题从多物理场机理出发，经过品质标定与降阶推演，最终利用多源感知在线对齐和 MPC 实现动态闭环控制，突破固定规程盲煮的局限。"},
-        {"no": 7, "title": "3.1 高保真热-流-固-生化物理底座", "core": ["14万级混合网格", "非牛顿降黏与多孔阻力模型", "固液共轭传热"], "script": "第一部分搭建物理底座。模型引入高黏酱汁受热剪切变稀、多孔菌菇渗流阻力和固液共轭传热，使冷点漂移和局部滞热能够被真实反演。"},
-        {"no": 8, "title": "3.2 品质特征多源标定与动力学映射", "core": ["GC-MS 风味物质提取", "TPA 质构硬度检测", "Arrhenius 动力学模型"], "script": "第二部分解决品质量化。通过 GC-MS 和 TPA 提取风味挥发与质构软化数据，并拟合为 Arrhenius 动力学方程，把口感与品质转化为可计算约束。"},
-        {"no": 9, "title": "3.3 基于 ANODE 的亚秒级降阶推演", "core": ["APBRS 多工况泛化特训", "增广隐变量空间", "单次推演耗时缩减至亚秒级"], "script": "第三部分为系统提速。通过 APBRS 伪随机工况训练 ANODE 数字大脑，用增广隐变量区分复杂热历史，实现亚秒级推演和虚拟排雷。"},
-        {"no": 10, "title": "3.4 MHE 在线校正与 Pareto-MPC 闭环", "core": ["250s 滑动窗口对齐漂移", "Pareto-MPC 多目标滚动寻优"], "script": "第四部分实现在线闭环。MHE 定期融合传感数据洗刷模型漂移，MPC 向前预测未来工艺结果，在安全与品质之间寻找最佳控制路径。"},
-        {"no": 11, "title": "3.5 虚实同步实验方案", "core": ["桌面级微型杀菌釜验证平台", "对照组：121.1℃恒温", "实验组：动态 DT-MPC"], "script": "实验上搭建多模态微型杀菌釜平台，以传统恒温杀菌为对照，以数字孪生变温控制为实验组，通过理化和风味检测完成双闭环验证。"},
-        {"no": 12, "title": "3.6 创新性描述", "core": ["机理深度耦合创新", "ANODE 与泛化训练结合", "隐变量在线校正闭环"], "script": "本课题打破食品仿真和自动控制的边界，将风味与质构动力学融入流固耦合网络，并通过隐变量在线校正增强系统实战能力。"},
-        {"no": 13, "title": "4.1 研究基础 (1)：物理底座与热滞后验证", "core": ["克服4%刚性假死提取黄金数据", "验证高黏体系4.4K极强热滞后"], "script": "前期已跑通 14 万单元复杂物理底座，并验证高黏预制菜内部存在约 4.4K 的热滞后误差，这为虚实同步校正提供了直接依据。"},
-        {"no": 14, "title": "4.1 研究基础 (2)：极速排雷与海量工艺寻优", "core": ["成功排除传统工艺安全大雷", "26.7分钟完成27.28万次全空间配方扫描"], "script": "依托初步训练的数字大脑，已在虚拟空间低成本排除传统工艺风险，并在普通 CPU 上完成 27 万多种工艺配方扫描，验证了降阶寻优可行性。"},
-        {"no": 15, "title": "4.2 预期进展", "core": ["平台搭建与校准", "高保真建模与动力学实验", "降阶推演与校正算法开发", "闭环验证与论文撰写"], "script": "项目将先完成平台搭建与品质动力学实验，中期攻克降阶模型训练和 MHE 对齐算法，后期开展闭环对照实验并完成论文撰写。"},
-        {"no": 16, "title": "结尾页｜敬请各位老师批评指正", "core": ["敬请各位老师批评指正！", "汇报人：杨阳"], "script": "以数字孪生引领预制菜从经验盲煮走向智能加工，我的开题汇报到此结束。敬请各位专家老师批评指正，谢谢大家！"},
+def _extract_title_and_people(text: str) -> dict[str, str]:
+    compact = re.sub(r"\s+", " ", text)
+    title = ""
+    for pattern in [
+        r"论文题目[:：]?\s*([^。；;\n]{8,120})",
+        r"题目[:：]?\s*([^。；;\n]{8,120})",
+        r"研究题目[:：]?\s*([^。；;\n]{8,120})",
+    ]:
+        match = re.search(pattern, compact)
+        if match:
+            title = match.group(1).strip()
+            break
+    if not title:
+        for line in text.splitlines():
+            if 12 <= len(line.strip()) <= 80 and not re.match(r"^\d", line.strip()):
+                title = line.strip()
+                break
+    title = title or "学术开题报告"
+    presenter = re.search(r"(姓名|汇报人)[:：]?\s*([\u4e00-\u9fa5A-Za-z0-9·]{2,20})", compact)
+    advisor = re.search(r"(导师|指导教师)[:：]?\s*([^。；;\n]{2,30})", compact)
+    unit = re.search(r"(学院|单位|学校)[:：]?\s*([^。；;\n]{2,40})", compact)
+    return {
+        "title": title,
+        "presenter": presenter.group(2).strip() if presenter else "请补充",
+        "advisor": advisor.group(2).strip() if advisor else "请补充",
+        "unit": unit.group(2).strip() if unit else "请补充",
+    }
+
+
+def _extract_section_text(text: str, keywords: Sequence[str], limit: int = 260) -> str:
+    paragraphs = [p.strip() for p in re.split(r"\n+", text) if p.strip()]
+    hits = [p for p in paragraphs if any(k in p for k in keywords)]
+    if not hits:
+        hits = paragraphs[:3]
+    merged = "；".join(hits[:3])
+    return merged[:limit]
+
+
+def _extract_research_modules(text: str) -> list[str]:
+    modules: list[str] = []
+    for line in text.splitlines():
+        clean = re.sub(r"\s+", " ", line.strip())
+        if not clean:
+            continue
+        if re.match(r"^(\d+\.\d+(\.\d+)?|[（(]?\d+[）)]|[一二三四]、)", clean) and any(
+            key in clean for key in ("研究内容", "内容", "方法", "模型", "实验", "方案", "技术", "系统")
+        ):
+            if clean not in modules and len(clean) <= 90:
+                modules.append(clean)
+    if len(modules) < 3:
+        modules += ["研究内容一：理论基础与问题建模", "研究内容二：方法体系与模型构建", "研究内容三：实验验证与应用评价"]
+    return modules[:4]
+
+
+def _collect_images(image_list: str | os.PathLike | Iterable[str | os.PathLike]) -> list[Path]:
+    if isinstance(image_list, (str, os.PathLike)):
+        raw = _path(image_list)
+        if raw.is_dir():
+            return sorted([p for p in raw.iterdir() if p.suffix.lower() in IMAGE_SUFFIXES], key=lambda p: p.name.lower())
+        if raw.is_file() and raw.suffix.lower() in IMAGE_SUFFIXES:
+            return [raw]
+        if raw.is_file():
+            return [
+                _path(line.strip())
+                for line in raw.read_text(encoding="utf-8", errors="ignore").splitlines()
+                if line.strip()
+            ]
+        parts = [part.strip() for part in str(image_list).split(";") if part.strip()]
+        return [_path(part) for part in parts]
+    return [_path(item) for item in image_list]
+
+
+def _score_image(name: str, keywords: Sequence[str]) -> int:
+    lower = name.lower()
+    return sum(3 if key.lower() in lower else 0 for key in keywords)
+
+
+def _assign_images(images: list[Path]) -> dict[int, Path]:
+    slide_keywords = {
+        4: ["痛点", "问题", "背景", "矛盾", "需求", "pain", "problem"],
+        6: ["路线", "技术路线", "框架", "roadmap", "route", "workflow"],
+        7: ["模型", "方法", "仿真", "机制", "model", "method"],
+        8: ["检测", "感知", "数据", "指标", "评价", "sensor", "data"],
+        9: ["算法", "网络", "降阶", "预测", "ai", "ml", "algorithm"],
+        10: ["控制", "闭环", "优化", "决策", "control", "optimization"],
+        11: ["实验", "平台", "装置", "验证", "experiment", "platform"],
+        13: ["基础", "成果", "预研", "结果", "foundation", "result"],
+        15: ["进度", "计划", "时间", "甘特", "schedule", "gantt"],
+    }
+    available = images[:]
+    assigned: dict[int, Path] = {}
+    for slide, keys in slide_keywords.items():
+        if not available:
+            break
+        best = max(available, key=lambda p: _score_image(p.name, keys))
+        if _score_image(best.name, keys) > 0:
+            assigned[slide] = best
+            available.remove(best)
+    return assigned
+
+
+def _make_core_points(source: str, fallback: Sequence[str]) -> list[str]:
+    text = re.sub(r"\s+", " ", source).strip()
+    clauses = re.split(r"[。；;]", text)
+    points = [c.strip() for c in clauses if 8 <= len(c.strip()) <= 42]
+    return (points[:3] or list(fallback))[:4]
+
+
+def _build_generic_slides(text: str, images: list[Path]) -> list[dict]:
+    meta = _extract_title_and_people(text)
+    modules = _extract_research_modules(text)
+    assignment = _assign_images(images)
+    background = _extract_section_text(text, ["背景", "意义", "需求", "发展"])
+    pain = _extract_section_text(text, ["问题", "痛点", "不足", "挑战", "矛盾"])
+    target = _extract_section_text(text, ["目标", "技术路线", "路线", "任务"])
+    experiment = _extract_section_text(text, ["实验", "验证", "评价", "样品", "平台"])
+    innovation = _extract_section_text(text, ["创新", "特色", "贡献"])
+    foundation = _extract_section_text(text, ["研究基础", "已有", "前期", "条件"])
+    schedule = _extract_section_text(text, ["进度", "计划", "安排", "时间"])
+
+    slides = [
+        {
+            "no": 1,
+            "title": f"封面｜{meta['title']}",
+            "core": [meta["unit"], "学术开题答辩", f"汇报人：{meta['presenter']}", f"导师：{meta['advisor']}"],
+            "script": f"各位老师好，我汇报的题目是《{meta['title']}》。接下来我将围绕研究背景、目标路线、研究内容和预期安排进行说明。",
+        },
+        {
+            "no": 2,
+            "title": "目录大纲｜Contents",
+            "core": ["01 研究背景与问题提出", "02 研究目标与技术路线", "03 研究内容与实验方案", "04 研究基础与进度安排"],
+            "script": "本次汇报按照四个部分展开：先说明课题为什么值得做，再介绍研究目标和总体路线，随后展开关键研究内容，最后汇报基础条件和进度安排。",
+        },
+        {
+            "no": 3,
+            "title": "1.1 研究背景",
+            "core": _make_core_points(background, ["研究对象具有明确应用需求", "现有方法存在提升空间", "课题具有理论与实践价值"]),
+            "script": "本课题来源于当前领域发展的真实需求。现有研究和工程实践已经积累了一定基础，但面对更高精度、更强可靠性和更好应用效果的要求，仍需要进一步系统化研究。",
+        },
+        {
+            "no": 4,
+            "title": "1.2 核心痛点与科学问题",
+            "core": _make_core_points(pain, ["关键状态难以准确刻画", "多目标之间存在冲突", "现有方法缺乏闭环验证"]),
+            "script": "本课题要解决的核心问题，是现有方法在真实场景中仍存在信息不完整、机制解释不足和验证链条不闭合等问题。因此，研究不能只停留在单一指标改进，而要形成可解释、可验证的整体方案。",
+        },
+        {
+            "no": 5,
+            "title": "1.3 国内外现状与局限",
+            "core": ["已有研究提供理论基础", "方法体系仍较分散", "面向本课题对象的系统整合不足"],
+            "script": "从国内外现状看，相关研究已经在理论方法、实验手段和应用验证方面形成基础。但这些成果往往分散在不同方向，针对本课题对象的系统整合、关键参数解释和工程化验证仍显不足。",
+        },
+        {
+            "no": 6,
+            "title": "2.1 研究目标与总体路线",
+            "core": _make_core_points(target, ["构建完整技术路线", "形成可验证的方法体系", "实现理论模型与应用场景衔接"]),
+            "script": "基于上述问题，本课题拟建立一套从理论分析、方法构建到实验验证的完整路线。核心目标不是孤立完成某个环节，而是让模型、数据、实验和评价之间形成闭环。",
+        },
     ]
-
-
-def _blueprint_image(slide_no: int, image_dir: Path) -> Path | None:
-    name = PPT_IMAGE_MAP.get(slide_no)
-    return image_dir / name if name else None
-
-
-def _write_blueprint_markdown(slides: Iterable[dict], image_dir: Path) -> str:
-    lines = ["# PPT制作与演讲蓝图指导书_16页版", ""]
+    for idx, module in enumerate(modules[:4], start=7):
+        slides.append(
+            {
+                "no": idx,
+                "title": f"3.{idx - 6} {module}",
+                "core": ["明确研究对象与输入输出", "构建关键方法或模型", "形成可评价的结果指标"],
+                "script": f"这一部分围绕“{module}”展开。重点是把研究对象、关键变量和评价指标说清楚，并通过合适的方法或模型建立可分析、可复现的研究路径。",
+            }
+        )
+    while len(slides) < 10:
+        no = len(slides) + 1
+        slides.append(
+            {
+                "no": no,
+                "title": f"3.{no - 6} 研究内容补充模块",
+                "core": ["补充关键技术环节", "完善验证与评价逻辑", "支撑总体研究目标"],
+                "script": "本页用于补充说明研究中的关键技术环节，保证整体方案从问题提出到结果评价之间逻辑完整、层次清楚。",
+            }
+        )
+    slides += [
+        {
+            "no": 11,
+            "title": "3.5 实验方案与验证机制",
+            "core": _make_core_points(experiment, ["设计对照实验", "建立评价指标", "形成数据-模型-结果验证闭环"]),
+            "script": "实验方案将围绕研究目标设置对照和验证环节。通过关键指标采集、统计分析和模型结果对比，判断所提出方法是否真正改善了问题。",
+        },
+        {
+            "no": 12,
+            "title": "3.6 创新点与特色",
+            "core": _make_core_points(innovation, ["理论机制创新", "方法体系创新", "验证路径创新"]),
+            "script": "本课题的创新性主要体现在三方面：一是围绕具体问题建立解释机制；二是形成可执行的方法体系；三是通过实验或案例验证，使研究结论具有可落地性。",
+        },
+        {
+            "no": 13,
+            "title": "4.1 研究基础",
+            "core": _make_core_points(foundation, ["具备相关研究积累", "具备数据或实验条件", "具备继续推进的技术基础"]),
+            "script": "前期已经具备一定研究基础，包括资料积累、方法准备和实验条件。这些基础能够支撑课题后续从方案设计进入系统实施。",
+        },
+        {
+            "no": 14,
+            "title": "4.2 预期成果",
+            "core": ["形成开题报告与技术路线", "形成模型或方法原型", "形成实验数据、论文或应用成果"],
+            "script": "预期成果包括三类：第一是完整的理论与技术路线；第二是可复现的方法或系统原型；第三是支撑论文写作和后续应用的数据与结果。",
+        },
+        {
+            "no": 15,
+            "title": "4.3 进度安排",
+            "core": _make_core_points(schedule, ["阶段一：资料整理与方案细化", "阶段二：方法构建与实验验证", "阶段三：结果分析与论文撰写"]),
+            "script": "进度安排上，前期重点完成资料整理和方案细化，中期集中开展方法构建和实验验证，后期进行结果分析、论文撰写和成果凝练。",
+        },
+        {
+            "no": 16,
+            "title": "结尾页｜敬请批评指正",
+            "core": ["谢谢各位老师", "敬请批评指正"],
+            "script": "以上就是我的开题汇报。恳请各位老师对研究问题、技术路线和实验安排提出宝贵意见，我会根据建议继续完善课题设计。谢谢大家。",
+        },
+    ]
     for slide in slides:
-        img = _blueprint_image(slide["no"], image_dir)
-        img_text = str(img) if img and img.exists() else ("无" if img is None else f"{img}（未找到，请补图）")
-        lines += [
-            f"## Slide {slide['no']:02d}",
-            "",
-            f"**【幻灯片标题】**：{slide['title']}",
-            "",
-            f"**【指定插入图片】**：{img_text}",
-            "",
-            "**【PPT 核心文字】**",
-            "",
-        ]
-        lines += [f"- {item}" for item in slide["core"]]
-        lines += ["", f"**【汇报讲稿】**：{slide['script']}", ""]
-    return "\n".join(lines)
+        slide["image"] = assignment.get(slide["no"])
+    return slides[:16]
 
 
-def _write_blueprint_docx(slides: Iterable[dict], image_dir: Path, output: Path) -> None:
+def _write_blueprint_docx(slides: list[dict], output: Path) -> None:
     doc = Document()
-    doc.add_heading("PPT制作与演讲蓝图指导书_16页版", 0)
+    doc.add_heading("PPT制作与演讲蓝图指导书", 0)
     for slide in slides:
         doc.add_heading(f"Slide {slide['no']:02d}", level=1)
         doc.add_paragraph(f"【幻灯片标题】：{slide['title']}")
-        img = _blueprint_image(slide["no"], image_dir)
-        if img and img.exists():
-            doc.add_paragraph(f"【指定插入图片】：{img}")
-            try:
-                doc.add_picture(str(img), width=Cm(14.5))
-            except Exception:
-                doc.add_paragraph("（图片预览插入失败，但路径已保留。）")
-        elif img:
-            doc.add_paragraph(f"【指定插入图片】：{img}（未找到，请补图）")
+        image_path = slide.get("image")
+        if image_path:
+            doc.add_paragraph(f"【指定插入图片】：{image_path}")
         else:
-            doc.add_paragraph("【指定插入图片】：无")
+            p = doc.add_paragraph()
+            p.add_run("【指定插入图片】：")
+            run = p.add_run("【红色占位符】请根据本页主题补充合适图片或图表")
+            run.font.color.rgb = RGBColor(192, 0, 0)
         doc.add_paragraph("【PPT 核心文字】")
         for item in slide["core"]:
             doc.add_paragraph(item, style="List Bullet")
@@ -397,55 +724,114 @@ def _write_blueprint_docx(slides: Iterable[dict], image_dir: Path, output: Path)
     doc.save(str(output))
 
 
+def _write_blueprint_markdown(slides: list[dict], output: Path) -> None:
+    lines = ["# PPT制作与演讲蓝图指导书", ""]
+    for slide in slides:
+        image_text = str(slide.get("image")) if slide.get("image") else "【红色占位符】请根据本页主题补充合适图片或图表"
+        lines += [
+            f"## Slide {slide['no']:02d}",
+            "",
+            f"**【幻灯片标题】**：{slide['title']}",
+            "",
+            f"**【指定插入图片】**：{image_text}",
+            "",
+            "**【PPT 核心文字】**",
+            "",
+        ]
+        lines += [f"- {item}" for item in slide["core"]]
+        lines += ["", f"**【汇报讲稿】**：{slide['script']}", ""]
+    output.parent.mkdir(parents=True, exist_ok=True)
+    output.write_text("\n".join(lines), encoding="utf-8")
+
+
+def generate_generic_ppt_blueprint(
+    input_docx: str | os.PathLike,
+    image_list: str | os.PathLike | Iterable[str | os.PathLike],
+    output_blueprint: str | os.PathLike,
+) -> Path:
+    """Generate a generic 15-16 page academic defense PPT Word guide."""
+
+    src = _path(input_docx)
+    output = _path(output_blueprint)
+    text = _read_docx_text(src, 70000)
+    images = _collect_images(image_list)
+    slides = _build_generic_slides(text, images)
+    if output.suffix.lower() == ".docx":
+        _write_blueprint_docx(slides, output)
+    else:
+        _write_blueprint_markdown(slides, output)
+    return output
+
+
+def rewrite_and_balance_proposal(
+    gemini_draft_file: str | os.PathLike,
+    output_file: str | os.PathLike,
+    references_dir: str | os.PathLike | None = None,
+    template_file: str | os.PathLike | None = None,
+) -> Path:
+    """Backward-compatible wrapper for older callers.
+
+    New code should call `synthesize_and_rewrite_proposal(...)` directly.
+    """
+
+    if references_dir is None or template_file is None:
+        draft = _path(gemini_draft_file)
+        dst = _path(output_file)
+        prompt = (
+            "# 通用学术开题报告生成任务包\n\n"
+            "请补充 references_dir 与 template_file 后调用 synthesize_and_rewrite_proposal。\n\n"
+            "## 底稿内容\n\n"
+            f"{_read_any_text(draft, 70000)}\n"
+        )
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        dst.write_text(prompt, encoding="utf-8")
+        return dst
+    return synthesize_and_rewrite_proposal(gemini_draft_file, references_dir, template_file, output_file)
+
+
 def generate_ppt_blueprint(
     input_docx: str | os.PathLike,
     image_dir: str | os.PathLike,
     output_blueprint: str | os.PathLike,
 ) -> Path:
-    """Generate a strict 16-slide proposal-defense blueprint.
+    """Backward-compatible wrapper for older callers."""
 
-    `input_docx` is read to verify and preserve provenance. The slide structure is
-    the refined Zhang-Baitao-style four-module blueprint used in this project.
-    """
-
-    src = _path(input_docx)
-    images = _path(image_dir)
-    output = _path(output_blueprint)
-    _ = _read_docx_text(src)
-    slides = _make_slide_blueprint()
-    if output.suffix.lower() == ".docx":
-        _write_blueprint_docx(slides, images, output)
-    else:
-        output.parent.mkdir(parents=True, exist_ok=True)
-        output.write_text(_write_blueprint_markdown(slides, images), encoding="utf-8")
-    return output
+    return generate_generic_ppt_blueprint(input_docx, image_dir, output_blueprint)
 
 
 def _parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Kaiti proposal workflow helpers.")
+    parser = argparse.ArgumentParser(description="Generic academic proposal workflow helpers.")
     sub = parser.add_subparsers(dest="cmd", required=True)
-    p = sub.add_parser("rewrite")
-    p.add_argument("input_file")
+
+    p = sub.add_parser("synthesize")
+    p.add_argument("gemini_draft_file")
+    p.add_argument("references_dir")
+    p.add_argument("template_file")
     p.add_argument("output_file")
+
     p = sub.add_parser("format")
     p.add_argument("input_docx")
-    p.add_argument("reference_template")
+    p.add_argument("template_file")
     p.add_argument("output_docx")
+
     p = sub.add_parser("blueprint")
     p.add_argument("input_docx")
-    p.add_argument("image_dir")
+    p.add_argument("image_list")
     p.add_argument("output_blueprint")
+
     return parser.parse_args()
 
 
 def main() -> None:
     args = _parse_args()
-    if args.cmd == "rewrite":
-        out = rewrite_and_balance_proposal(args.input_file, args.output_file)
+    if args.cmd == "synthesize":
+        out = synthesize_and_rewrite_proposal(
+            args.gemini_draft_file, args.references_dir, args.template_file, args.output_file
+        )
     elif args.cmd == "format":
-        out = format_academic_docx(args.input_docx, args.reference_template, args.output_docx)
+        out = format_academic_docx(args.input_docx, args.template_file, args.output_docx)
     elif args.cmd == "blueprint":
-        out = generate_ppt_blueprint(args.input_docx, args.image_dir, args.output_blueprint)
+        out = generate_generic_ppt_blueprint(args.input_docx, args.image_list, args.output_blueprint)
     else:  # pragma: no cover
         raise SystemExit(f"Unknown command: {args.cmd}")
     print(out)
